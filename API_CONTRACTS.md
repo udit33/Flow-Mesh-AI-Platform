@@ -79,6 +79,31 @@ Response (202 Accepted):
 }
 ```
 
+### GET /v1/workflow-instances?workflow_id=&status=
+List workflow instances for current tenant.
+
+Supported filters:
+- `workflow_id=<uuid>`
+- `status=running|waiting_approval|succeeded|failed|cancelled`
+
+Response:
+```json
+{
+  "items": [
+    {
+      "instance_id": "wf_run_001",
+      "tenant_id": "...",
+      "workflow_id": "...",
+      "status": "running",
+      "current_node": "start",
+      "trace_id": "tr_456",
+      "started_at": "2026-03-11T00:00:00Z",
+      "completed_at": null
+    }
+  ]
+}
+```
+
 ### GET /v1/workflow-instances/{instance_id}
 Response:
 ```json
@@ -91,6 +116,54 @@ Response:
   "trace_id": "tr_456",
   "started_at": "2026-03-11T00:00:00Z",
   "completed_at": null
+}
+```
+
+### POST /v1/workflow-instances/{instance_id}/cancel
+Role required: `builder` or `tenant_admin`
+
+Request:
+```json
+{"reason":"operator cancelled"}
+```
+
+Response:
+```json
+{"instance_id":"wf_run_001","status":"cancelled"}
+```
+
+### POST /v1/workflow-instances/{instance_id}/retry
+Role required: `builder` or `tenant_admin`
+
+Request:
+```json
+{"reason":"rerun after fix"}
+```
+
+Response:
+```json
+{"instance_id":"wf_run_001","status":"running"}
+```
+
+### GET /v1/workflow-instances/{instance_id}/events
+Returns normalized lifecycle events:
+`run_created`, `node_started`, `node_completed`, `approval_waiting`, `approval_decided`, `run_completed`, `run_failed`, `run_cancelled`
+
+Response:
+```json
+{
+  "items": [
+    {
+      "id": "<event_uuid>",
+      "instance_id": "wf_run_001",
+      "tenant_id": "...",
+      "event_type": "run_created",
+      "node_id": null,
+      "status": "running",
+      "created_at": "2026-03-12T00:00:00Z",
+      "data": {}
+    }
+  ]
 }
 ```
 

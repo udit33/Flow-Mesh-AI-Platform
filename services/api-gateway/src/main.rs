@@ -20,6 +20,7 @@ struct AppState {
     jwt_secret: Option<Arc<String>>,
     agent_runtime_url: Arc<String>,
     http_client: reqwest::Client,
+    workflows: Arc<RwLock<HashMap<Uuid, WorkflowRecord>>>,
     workflow_runs: Arc<RwLock<HashMap<Uuid, WorkflowRun>>>,
     approvals: Arc<RwLock<HashMap<Uuid, ApprovalRecord>>>,
     tools: Arc<RwLock<HashMap<Uuid, ToolRecord>>>,
@@ -312,6 +313,7 @@ async fn init_state() -> AppState {
         jwt_secret,
         agent_runtime_url: Arc::new(agent_runtime_url),
         http_client,
+        workflows: Arc::new(RwLock::new(HashMap::new())),
         workflow_runs: Arc::new(RwLock::new(HashMap::new())),
         approvals: Arc::new(RwLock::new(HashMap::new())),
         tools: Arc::new(RwLock::new(HashMap::new())),
@@ -463,8 +465,8 @@ async fn run_workflow(
         instance_id,
         tenant_id: ctx.tenant_id,
         workflow_id,
-        status: WorkflowRunStatus::Running,
-        current_node: Some("start".to_string()),
+        status: WorkflowRunStatus::WaitingApproval,
+        current_node: Some("approval".to_string()),
         trace_id: trace_id.clone(),
         started_at: chrono::Utc::now().to_rfc3339(),
         completed_at: None,
@@ -472,13 +474,26 @@ async fn run_workflow(
 
     persist_run(&state, &run).await?;
 
+    let approval = ApprovalRecord {
+        id: Uuid::new_v4(),
+        tenant_id: ctx.tenant_id,
+        run_id: instance_id,
+        requester: ctx.user_id.map(|u| u.to_string()).unwrap_or_else(|| "system".to_string()),
+        reason: "Workflow execution requires approval".to_string(),
+        due_at: (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+        status: ApprovalStatus::Pending,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        decided_at: None,
+    };
+    persist_approval(&state, &approval).await?;
+
     record_workflow_event(
         &state,
         instance_id,
         ctx.tenant_id,
         WorkflowEventType::RunCreated,
         None,
-        Some(WorkflowRunStatus::Running),
+        Some(WorkflowRunStatus::WaitingApproval),
         serde_json::json!({}),
     )
     .await;
@@ -486,10 +501,10 @@ async fn run_workflow(
         &state,
         instance_id,
         ctx.tenant_id,
-        WorkflowEventType::NodeStarted,
-        Some("start".to_string()),
-        Some(WorkflowRunStatus::Running),
-        serde_json::json!({}),
+        WorkflowEventType::ApprovalWaiting,
+        Some("approval".to_string()),
+        Some(WorkflowRunStatus::WaitingApproval),
+        serde_json::json!({"approval_id": approval.id}),
     )
     .await;
 
@@ -896,111 +911,282 @@ async fn fetch_workflow_run(
     Ok(state.workflow_runs.read().await.get(&instance_id).cloned())
 }
 
+async fn fetch_approvals_for_tenant(
+    state: &AppState,
+    tenant_id: Uuid,
+    status_filter: Option<ApprovalStatus>,
+) -> Result<Vec<ApprovalRecord>, StatusCode> {
+    if let Some(db) = &state.db {
+        let rows = match status_filter {
+            Some(ref status) => sqlx::query("SELECT id, tenant_id, run_id, requester, reason, due_at, status, created_at, decided_at FROM approvals WHERE tenant_id = $1 AND status = $2 ORDER BY due_at ASC")
+                .bind(tenant_id).bind(status.as_db_str()).fetch_all(db).await,
+            None => sqlx::query("SELECT id, tenant_id, run_id, requester, reason, due_at, status, created_at, decided_at FROM approvals WHERE tenant_id = $1 ORDER BY due_at ASC")
+                .bind(tenant_id).fetch_all(db).await,
+        }.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        return rows.into_iter().map(row_to_approval).collect();
+    }
+    let approvals = state.approvals.read().await;
+    let mut items = approvals
+        .values()
+        .filter(|a| a.tenant_id == tenant_id)
+        .filter(|a| match status_filter.as_ref() {
+            Some(s) => &a.status == s,
+            None => true,
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    items.sort_by(|a, b| a.due_at.cmp(&b.due_at));
+    Ok(items)
+}
+
+async fn fetch_approval(
+    state: &AppState,
+    tenant_id: Uuid,
+    approval_id: Uuid,
+) -> Result<Option<ApprovalRecord>, StatusCode> {
+    if let Some(db) = &state.db {
+        let row = sqlx::query("SELECT id, tenant_id, run_id, requester, reason, due_at, status, created_at, decided_at FROM approvals WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id).bind(approval_id).fetch_optional(db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        return row.map(row_to_approval).transpose();
+    }
+    Ok(state
+        .approvals
+        .read()
+        .await
+        .get(&approval_id)
+        .filter(|a| a.tenant_id == tenant_id)
+        .cloned())
+}
+
+fn row_to_approval(r: sqlx::postgres::PgRow) -> Result<ApprovalRecord, StatusCode> {
+    let status_raw = r
+        .try_get::<String, _>("status")
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let status =
+        ApprovalStatus::from_db_str(&status_raw).ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(ApprovalRecord {
+        id: r
+            .try_get("id")
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        tenant_id: r
+            .try_get("tenant_id")
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        run_id: r
+            .try_get("run_id")
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        requester: r
+            .try_get("requester")
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        reason: r
+            .try_get("reason")
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        due_at: r
+            .try_get::<chrono::DateTime<chrono::Utc>, _>("due_at")
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .to_rfc3339(),
+        status,
+        created_at: r
+            .try_get::<chrono::DateTime<chrono::Utc>, _>("created_at")
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .to_rfc3339(),
+        decided_at: r
+            .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("decided_at")
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map(|v| v.to_rfc3339()),
+    })
+}
+
 async fn apply_approval_decision(
     state: &AppState,
     approval_id: Uuid,
     tenant_id: Uuid,
-    desired_status: WorkflowRunStatus,
-) -> Result<WorkflowRun, StatusCode> {
+    desired_status: ApprovalStatus,
+) -> Result<(ApprovalRecord, WorkflowRun), StatusCode> {
+    let approval = fetch_approval(state, tenant_id, approval_id)
+        .await?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if approval.status == desired_status {
+        let run = fetch_workflow_run(state, approval.run_id)
+            .await?
+            .ok_or(StatusCode::NOT_FOUND)?;
+        return Ok((approval, run));
+    }
+    if approval.status != ApprovalStatus::Pending {
+        return Err(StatusCode::CONFLICT);
+    }
+    let target_run_status = match desired_status {
+        ApprovalStatus::Approved => WorkflowRunStatus::Succeeded,
+        ApprovalStatus::Rejected => WorkflowRunStatus::Failed,
+        ApprovalStatus::Pending => return Err(StatusCode::BAD_REQUEST),
+    };
+    let now = chrono::Utc::now().to_rfc3339();
     if let Some(db) = &state.db {
-        let row = sqlx::query(
-            "UPDATE workflow_runs
-             SET status = $3,
-                 completed_at = COALESCE(completed_at, NOW())
-             WHERE id = $1
-               AND tenant_id = $2
-               AND (status IN ('running', 'waiting_approval') OR status = $3)
-             RETURNING id, tenant_id, workflow_id, status, trace_id, started_at, completed_at",
+        let mut tx = db
+            .begin()
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        sqlx::query("UPDATE approvals SET status = $3, decided_at = NOW() WHERE id = $1 AND tenant_id = $2 AND status = 'pending'")
+            .bind(approval_id).bind(tenant_id).bind(desired_status.as_db_str()).execute(&mut *tx).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        sqlx::query("UPDATE workflow_runs SET status = $3, completed_at = COALESCE(completed_at, NOW()) WHERE id = $1 AND tenant_id = $2")
+            .bind(approval.run_id).bind(tenant_id).bind(target_run_status.as_db_str()).execute(&mut *tx).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        tx.commit()
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    } else {
+        let mut approvals = state.approvals.write().await;
+        let appr = approvals
+            .get_mut(&approval_id)
+            .ok_or(StatusCode::NOT_FOUND)?;
+        if appr.tenant_id != tenant_id {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        appr.status = desired_status.clone();
+        appr.decided_at = Some(now.clone());
+        let mut runs = state.workflow_runs.write().await;
+        let run = runs
+            .get_mut(&approval.run_id)
+            .ok_or(StatusCode::NOT_FOUND)?;
+        if run.tenant_id != tenant_id {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        run.status = target_run_status;
+        run.current_node = None;
+        run.completed_at = Some(now.clone());
+    }
+    let approval = fetch_approval(state, tenant_id, approval_id)
+        .await?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let run = fetch_workflow_run(state, approval.run_id)
+        .await?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok((approval, run))
+}
+
+async fn persist_approval(state: &AppState, approval: &ApprovalRecord) -> Result<(), StatusCode> {
+    if let Some(db) = &state.db {
+        let due_at = chrono::DateTime::parse_from_rfc3339(&approval.due_at)
+            .map_err(|_| StatusCode::BAD_REQUEST)?
+            .with_timezone(&chrono::Utc);
+        sqlx::query(
+            "INSERT INTO approvals (id, tenant_id, run_id, requester, reason, due_at, status) VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
-        .bind(approval_id)
-        .bind(tenant_id)
-        .bind(desired_status.as_db_str())
-        .fetch_optional(db)
+        .bind(approval.id)
+        .bind(approval.tenant_id)
+        .bind(approval.run_id)
+        .bind(&approval.requester)
+        .bind(&approval.reason)
+        .bind(due_at)
+        .bind(approval.status.as_db_str())
+        .execute(db)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-        if let Some(r) = row {
-            let status_raw = r
-                .try_get::<String, _>("status")
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            let status = WorkflowRunStatus::from_db_str(&status_raw)
-                .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-
-            return Ok(WorkflowRun {
-                instance_id: r
-                    .try_get("id")
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
-                tenant_id: r
-                    .try_get("tenant_id")
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
-                workflow_id: r
-                    .try_get("workflow_id")
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
-                status,
-                current_node: None,
-                trace_id: r
-                    .try_get("trace_id")
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
-                started_at: r
-                    .try_get::<chrono::DateTime<chrono::Utc>, _>("started_at")
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-                    .to_rfc3339(),
-                completed_at: r
-                    .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("completed_at")
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-                    .map(|v| v.to_rfc3339()),
-            });
-        }
-
-        let existing =
-            sqlx::query("SELECT status FROM workflow_runs WHERE id = $1 AND tenant_id = $2")
-                .bind(approval_id)
-                .bind(tenant_id)
-                .fetch_optional(db)
-                .await
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-        return match existing {
-            Some(row) => {
-                let existing_status = row
-                    .try_get::<String, _>("status")
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                if existing_status == desired_status.as_db_str() {
-                    fetch_workflow_run(state, approval_id)
-                        .await?
-                        .ok_or(StatusCode::NOT_FOUND)
-                } else {
-                    Err(StatusCode::CONFLICT)
-                }
-            }
-            None => Err(StatusCode::NOT_FOUND),
-        };
+        return Ok(());
     }
 
-    // Bootstrap fallback only when DB is unavailable.
-    let mut runs = state.workflow_runs.write().await;
-    let run = runs.get_mut(&approval_id).ok_or(StatusCode::NOT_FOUND)?;
+    state.approvals.write().await.insert(approval.id, approval.clone());
+    Ok(())
+}
 
+async fn fetch_workflow_runs_for_tenant(
+    state: &AppState,
+    tenant_id: Uuid,
+    workflow_id: Option<Uuid>,
+    status: Option<WorkflowRunStatus>,
+) -> Result<Vec<WorkflowRun>, StatusCode> {
+    let runs: Vec<WorkflowRun> = state
+        .workflow_runs
+        .read()
+        .await
+        .values()
+        .cloned()
+        .filter(|r| r.tenant_id == tenant_id)
+        .filter(|r| workflow_id.as_ref().is_none_or(|wf| wf == &r.workflow_id))
+        .filter(|r| status.as_ref().is_none_or(|s| s == &r.status))
+        .collect();
+    Ok(runs)
+}
+
+async fn set_workflow_run_status(
+    state: &AppState,
+    instance_id: Uuid,
+    tenant_id: Uuid,
+    target_status: WorkflowRunStatus,
+) -> Result<WorkflowRun, StatusCode> {
+    let mut runs = state.workflow_runs.write().await;
+    let run = runs.get_mut(&instance_id).ok_or(StatusCode::NOT_FOUND)?;
     if run.tenant_id != tenant_id {
         return Err(StatusCode::FORBIDDEN);
     }
-
-    if run.status == desired_status {
-        return Ok(run.clone());
+    run.status = target_status;
+    if matches!(run.status, WorkflowRunStatus::Succeeded | WorkflowRunStatus::Failed | WorkflowRunStatus::Cancelled) {
+        run.completed_at = Some(chrono::Utc::now().to_rfc3339());
     }
-
-    if matches!(
-        run.status,
-        WorkflowRunStatus::Succeeded | WorkflowRunStatus::Failed
-    ) {
-        return Err(StatusCode::CONFLICT);
-    }
-
-    run.status = desired_status;
-    run.current_node = None;
-    run.completed_at = Some(chrono::Utc::now().to_rfc3339());
-
     Ok(run.clone())
+}
+
+async fn retry_workflow_run(
+    state: &AppState,
+    instance_id: Uuid,
+    tenant_id: Uuid,
+) -> Result<WorkflowRun, StatusCode> {
+    let mut run = set_workflow_run_status(state, instance_id, tenant_id, WorkflowRunStatus::Running).await?;
+    run.current_node = Some("start".to_string());
+    run.completed_at = None;
+    state.workflow_runs.write().await.insert(instance_id, run.clone());
+    Ok(run)
+}
+
+async fn fetch_workflow_events(
+    state: &AppState,
+    tenant_id: Uuid,
+    instance_id: Uuid,
+) -> Result<Vec<WorkflowEvent>, StatusCode> {
+    let items = state
+        .workflow_events
+        .read()
+        .await
+        .iter()
+        .filter(|e| e.tenant_id == tenant_id && e.run_id == instance_id)
+        .filter_map(|e| {
+            let event_type = WorkflowEventType::from_str(&e.event_type)?;
+            Some(WorkflowEvent {
+                id: e.id,
+                instance_id: e.run_id,
+                tenant_id: e.tenant_id,
+                event_type,
+                node_id: e.payload_json.get("node_id").and_then(|v| v.as_str()).map(|v| v.to_string()),
+                status: e.payload_json.get("status").and_then(|v| v.as_str()).and_then(WorkflowRunStatus::from_db_str),
+                created_at: e.created_at.clone(),
+                data: e.payload_json.clone(),
+            })
+        })
+        .collect();
+    Ok(items)
+}
+
+async fn record_workflow_event(
+    state: &AppState,
+    instance_id: Uuid,
+    tenant_id: Uuid,
+    event_type: WorkflowEventType,
+    node_id: Option<String>,
+    status: Option<WorkflowRunStatus>,
+    data: serde_json::Value,
+) {
+    let payload = serde_json::json!({
+        "instance_id": instance_id,
+        "node_id": node_id,
+        "status": status.as_ref().map(|s| s.as_db_str()),
+        "data": data,
+    });
+    state.workflow_events.write().await.push(WorkflowEventRecord {
+        id: Uuid::new_v4(),
+        tenant_id,
+        run_id: instance_id,
+        event_type: event_type.as_str().to_string(),
+        payload_json: payload,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    });
 }
 
 async fn persist_tool(state: &AppState, tool: &ToolRecord) -> Result<(), StatusCode> {
@@ -1369,9 +1555,12 @@ mod tests {
                 .timeout(std::time::Duration::from_millis(200))
                 .build()
                 .unwrap(),
+            workflows: Arc::new(RwLock::new(HashMap::new())),
             workflow_runs: Arc::new(RwLock::new(HashMap::new())),
+            approvals: Arc::new(RwLock::new(HashMap::new())),
             tools: Arc::new(RwLock::new(HashMap::new())),
             audit_events: Arc::new(RwLock::new(Vec::new())),
+            workflow_events: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -1912,5 +2101,61 @@ mod tests {
             .unwrap();
         let approvals_json: serde_json::Value = serde_json::from_slice(&approvals_body).unwrap();
         assert_eq!(approvals_json["items"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn workflow_instances_list_supports_filters() {
+        let tenant = Uuid::new_v4();
+        let workflow_a = Uuid::new_v4();
+        let workflow_b = Uuid::new_v4();
+        let app = build_app(test_state());
+
+        let _ = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri(format!("/v1/workflows/{workflow_a}/run"))
+                    .header("content-type", "application/json")
+                    .header("x-tenant-id", tenant.to_string())
+                    .header("x-roles", "builder")
+                    .body(Body::from(r#"{"trigger":"manual"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let _ = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri(format!("/v1/workflows/{workflow_b}/run"))
+                    .header("content-type", "application/json")
+                    .header("x-tenant-id", tenant.to_string())
+                    .header("x-roles", "builder")
+                    .body(Body::from(r#"{"trigger":"manual"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let res = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/v1/workflow-instances?workflow_id={workflow_a}&status=running"
+                    ))
+                    .header("x-tenant-id", tenant.to_string())
+                    .header("x-roles", "builder")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["items"].as_array().unwrap().len(), 1);
     }
 }
