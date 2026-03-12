@@ -24,3 +24,6 @@ Then open:
 
 - API Gateway health: `http://127.0.0.1:8080/health`
 - Control Plane UI shell: `http://127.0.0.1:8080/`
+
+## Frontend (Monorepo)
+- `apps/control-plane-ui` (Next.js scaffold)
