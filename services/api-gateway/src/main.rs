@@ -1,6 +1,6 @@
 use axum::{
     Extension, Json, Router,
-    extract::{Path, Request, State},
+    extract::{Path, Query, Request, State},
     http::{StatusCode, header::AUTHORIZATION, header::HeaderName},
     middleware::Next,
     response::{Html, IntoResponse},
@@ -21,8 +21,10 @@ struct AppState {
     agent_runtime_url: Arc<String>,
     http_client: reqwest::Client,
     workflow_runs: Arc<RwLock<HashMap<Uuid, WorkflowRun>>>,
+    approvals: Arc<RwLock<HashMap<Uuid, ApprovalRecord>>>,
     tools: Arc<RwLock<HashMap<Uuid, ToolRecord>>>,
     audit_events: Arc<RwLock<Vec<AuditEventRecord>>>,
+    workflow_events: Arc<RwLock<Vec<WorkflowEventRecord>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -32,6 +34,7 @@ enum WorkflowRunStatus {
     WaitingApproval,
     Succeeded,
     Failed,
+    Cancelled,
 }
 
 impl WorkflowRunStatus {
@@ -41,6 +44,7 @@ impl WorkflowRunStatus {
             Self::WaitingApproval => "waiting_approval",
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
         }
     }
 
@@ -50,9 +54,64 @@ impl WorkflowRunStatus {
             "waiting_approval" => Some(Self::WaitingApproval),
             "succeeded" => Some(Self::Succeeded),
             "failed" => Some(Self::Failed),
+            "cancelled" => Some(Self::Cancelled),
             _ => None,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum WorkflowEventType {
+    RunCreated,
+    NodeStarted,
+    NodeCompleted,
+    ApprovalWaiting,
+    ApprovalDecided,
+    RunCompleted,
+    RunFailed,
+    RunCancelled,
+}
+
+impl WorkflowEventType {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::RunCreated => "run_created",
+            Self::NodeStarted => "node_started",
+            Self::NodeCompleted => "node_completed",
+            Self::ApprovalWaiting => "approval_waiting",
+            Self::ApprovalDecided => "approval_decided",
+            Self::RunCompleted => "run_completed",
+            Self::RunFailed => "run_failed",
+            Self::RunCancelled => "run_cancelled",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "run_created" => Some(Self::RunCreated),
+            "node_started" => Some(Self::NodeStarted),
+            "node_completed" => Some(Self::NodeCompleted),
+            "approval_waiting" => Some(Self::ApprovalWaiting),
+            "approval_decided" => Some(Self::ApprovalDecided),
+            "run_completed" => Some(Self::RunCompleted),
+            "run_failed" => Some(Self::RunFailed),
+            "run_cancelled" => Some(Self::RunCancelled),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkflowEvent {
+    id: Uuid,
+    instance_id: Uuid,
+    tenant_id: Uuid,
+    event_type: WorkflowEventType,
+    node_id: Option<String>,
+    status: Option<WorkflowRunStatus>,
+    created_at: String,
+    data: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +138,62 @@ struct ApprovalDecisionRequest {
     comment: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ApprovalListQuery {
+    status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ApprovalStatus {
+    Pending,
+    Approved,
+    Rejected,
+}
+
+impl ApprovalStatus {
+    fn as_db_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+        }
+    }
+
+    fn from_db_str(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "approved" => Some(Self::Approved),
+            "rejected" => Some(Self::Rejected),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ApprovalRecord {
+    id: Uuid,
+    tenant_id: Uuid,
+    run_id: Uuid,
+    requester: String,
+    reason: String,
+    due_at: String,
+    status: ApprovalStatus,
+    created_at: String,
+    decided_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowInstancesQuery {
+    workflow_id: Option<Uuid>,
+    status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowActionRequest {
+    reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ToolRecord {
     id: Uuid,
@@ -98,6 +213,16 @@ struct AuditEventRecord {
     actor_user_id: Option<Uuid>,
     event_type: String,
     trace_id: Option<String>,
+    payload_json: serde_json::Value,
+    created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WorkflowEventRecord {
+    id: Uuid,
+    tenant_id: Uuid,
+    run_id: Uuid,
+    event_type: String,
     payload_json: serde_json::Value,
     created_at: String,
 }
@@ -188,8 +313,10 @@ async fn init_state() -> AppState {
         agent_runtime_url: Arc::new(agent_runtime_url),
         http_client,
         workflow_runs: Arc::new(RwLock::new(HashMap::new())),
+        approvals: Arc::new(RwLock::new(HashMap::new())),
         tools: Arc::new(RwLock::new(HashMap::new())),
         audit_events: Arc::new(RwLock::new(Vec::new())),
+        workflow_events: Arc::new(RwLock::new(Vec::new())),
     }
 }
 
@@ -200,10 +327,24 @@ fn build_app(state: AppState) -> Router {
         .route("/v1/runtime/complete", post(stub_complete))
         .route("/v1/admin/tenants", get(admin_tenant_list))
         .route("/v1/workflows/{workflow_id}/run", post(run_workflow))
+        .route("/v1/workflow-instances", get(list_workflow_instances))
         .route(
             "/v1/workflow-instances/{instance_id}",
             get(get_workflow_instance),
         )
+        .route(
+            "/v1/workflow-instances/{instance_id}/cancel",
+            post(cancel_workflow_instance),
+        )
+        .route(
+            "/v1/workflow-instances/{instance_id}/retry",
+            post(retry_workflow_instance),
+        )
+        .route(
+            "/v1/workflow-instances/{instance_id}/events",
+            get(get_workflow_instance_events),
+        )
+        .route("/v1/approvals", get(list_approvals))
         .route(
             "/v1/approvals/{approval_id}/decision",
             post(approval_decision),
@@ -331,6 +472,27 @@ async fn run_workflow(
 
     persist_run(&state, &run).await?;
 
+    record_workflow_event(
+        &state,
+        instance_id,
+        ctx.tenant_id,
+        WorkflowEventType::RunCreated,
+        None,
+        Some(WorkflowRunStatus::Running),
+        serde_json::json!({}),
+    )
+    .await;
+    record_workflow_event(
+        &state,
+        instance_id,
+        ctx.tenant_id,
+        WorkflowEventType::NodeStarted,
+        Some("start".to_string()),
+        Some(WorkflowRunStatus::Running),
+        serde_json::json!({}),
+    )
+    .await;
+
     Ok((
         StatusCode::ACCEPTED,
         Json(serde_json::json!({
@@ -341,6 +503,23 @@ async fn run_workflow(
             "inputs": payload.inputs
         })),
     ))
+}
+
+async fn list_workflow_instances(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+    Query(query): Query<WorkflowInstancesQuery>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let status_filter = query
+        .status
+        .as_deref()
+        .map(|s| WorkflowRunStatus::from_db_str(s).ok_or(StatusCode::BAD_REQUEST))
+        .transpose()?;
+
+    let items =
+        fetch_workflow_runs_for_tenant(&state, ctx.tenant_id, query.workflow_id, status_filter)
+            .await?;
+    Ok(Json(serde_json::json!({"items": items})))
 }
 
 async fn get_workflow_instance(
@@ -359,6 +538,104 @@ async fn get_workflow_instance(
     Ok(Json(run))
 }
 
+async fn cancel_workflow_instance(
+    State(state): State<AppState>,
+    Path(instance_id): Path<Uuid>,
+    Extension(ctx): Extension<TenantContext>,
+    Json(payload): Json<WorkflowActionRequest>,
+) -> Result<impl IntoResponse, StatusCode> {
+    if !ctx.has_role("tenant_admin") && !ctx.has_role("builder") {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let run = set_workflow_run_status(
+        &state,
+        instance_id,
+        ctx.tenant_id,
+        WorkflowRunStatus::Cancelled,
+    )
+    .await?;
+    record_workflow_event(
+        &state,
+        instance_id,
+        ctx.tenant_id,
+        WorkflowEventType::RunCancelled,
+        run.current_node.clone(),
+        Some(run.status.clone()),
+        serde_json::json!({"reason": payload.reason}),
+    )
+    .await;
+
+    Ok(Json(
+        serde_json::json!({"instance_id": instance_id, "status": run.status}),
+    ))
+}
+
+async fn retry_workflow_instance(
+    State(state): State<AppState>,
+    Path(instance_id): Path<Uuid>,
+    Extension(ctx): Extension<TenantContext>,
+    Json(payload): Json<WorkflowActionRequest>,
+) -> Result<impl IntoResponse, StatusCode> {
+    if !ctx.has_role("tenant_admin") && !ctx.has_role("builder") {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let run = retry_workflow_run(&state, instance_id, ctx.tenant_id).await?;
+    record_workflow_event(
+        &state,
+        instance_id,
+        ctx.tenant_id,
+        WorkflowEventType::NodeStarted,
+        run.current_node.clone(),
+        Some(run.status.clone()),
+        serde_json::json!({"reason": payload.reason}),
+    )
+    .await;
+
+    Ok(Json(
+        serde_json::json!({"instance_id": instance_id, "status": run.status}),
+    ))
+}
+
+async fn get_workflow_instance_events(
+    State(state): State<AppState>,
+    Path(instance_id): Path<Uuid>,
+    Extension(ctx): Extension<TenantContext>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let run = fetch_workflow_run(&state, instance_id)
+        .await?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    if run.tenant_id != ctx.tenant_id {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let items = fetch_workflow_events(&state, ctx.tenant_id, instance_id).await?;
+    Ok(Json(serde_json::json!({"items": items})))
+}
+
+async fn list_approvals(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+    Query(query): Query<ApprovalListQuery>,
+) -> Result<impl IntoResponse, StatusCode> {
+    if !ctx.has_role("tenant_admin") && !ctx.has_role("approver") {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let status_filter = match query.status.as_deref() {
+        None => None,
+        Some("pending") => Some(ApprovalStatus::Pending),
+        Some("approved") => Some(ApprovalStatus::Approved),
+        Some("rejected") => Some(ApprovalStatus::Rejected),
+        Some(_) => return Err(StatusCode::BAD_REQUEST),
+    };
+
+    let items = fetch_approvals_for_tenant(&state, ctx.tenant_id, status_filter).await?;
+    Ok(Json(serde_json::json!({"items": items})))
+}
+
 async fn approval_decision(
     State(state): State<AppState>,
     Path(approval_id): Path<Uuid>,
@@ -370,17 +647,73 @@ async fn approval_decision(
     }
 
     let desired_status = match payload.decision.as_str() {
-        "approve" => WorkflowRunStatus::Succeeded,
-        "reject" => WorkflowRunStatus::Failed,
+        "approve" => ApprovalStatus::Approved,
+        "reject" => ApprovalStatus::Rejected,
         _ => return Err(StatusCode::BAD_REQUEST),
     };
 
-    let updated =
-        apply_approval_decision(&state, approval_id, ctx.tenant_id, desired_status).await?;
+    let (approval, run) =
+        apply_approval_decision(&state, approval_id, ctx.tenant_id, desired_status.clone()).await?;
+
+    record_audit_event(
+        &state,
+        &ctx,
+        "approval.decision",
+        serde_json::json!({
+            "approval_id": approval.id,
+            "run_id": approval.run_id,
+            "decision": desired_status,
+            "comment": payload.comment,
+        }),
+        Some(run.trace_id.clone()),
+    )
+    .await;
+
+    let run_status = run.status.clone();
+    record_workflow_event(
+        &state,
+        approval.run_id,
+        approval.tenant_id,
+        WorkflowEventType::ApprovalDecided,
+        None,
+        Some(run_status.clone()),
+        serde_json::json!({
+            "approval_id": approval.id,
+            "status": approval.status,
+            "comment": payload.comment,
+        }),
+    )
+    .await;
+    record_workflow_event(
+        &state,
+        approval.run_id,
+        approval.tenant_id,
+        WorkflowEventType::NodeCompleted,
+        Some("approval".to_string()),
+        Some(run_status.clone()),
+        serde_json::json!({"approval_id": approval.id}),
+    )
+    .await;
+    record_workflow_event(
+        &state,
+        approval.run_id,
+        approval.tenant_id,
+        if run_status == WorkflowRunStatus::Succeeded {
+            WorkflowEventType::RunCompleted
+        } else {
+            WorkflowEventType::RunFailed
+        },
+        None,
+        Some(run_status.clone()),
+        serde_json::json!({}),
+    )
+    .await;
 
     Ok(Json(serde_json::json!({
-        "approval_id": approval_id,
-        "status": updated.status,
+        "approval_id": approval.id,
+        "status": approval.status,
+        "run_id": approval.run_id,
+        "run_status": run.status,
         "comment": payload.comment
     })))
 }
@@ -1198,8 +1531,32 @@ mod tests {
     async fn workflow_instance_is_tenant_isolated() {
         let tenant_a = Uuid::new_v4();
         let tenant_b = Uuid::new_v4();
-        let workflow_id = Uuid::new_v4();
         let app = build_app(test_state());
+
+        let create_req = HttpRequest::builder()
+            .method("POST")
+            .uri("/v1/workflows")
+            .header("content-type", "application/json")
+            .header("x-tenant-id", tenant_a.to_string())
+            .header("x-roles", "builder")
+            .body(Body::from(
+                r#"{"name":"wf1","version":"1","definition_json":{"nodes":[{"id":"start"}],"edges":[]}}"#,
+            ))
+            .unwrap();
+        let create_res = app.clone().oneshot(create_req).await.unwrap();
+        let create_body = to_bytes(create_res.into_body(), usize::MAX).await.unwrap();
+        let create_json: serde_json::Value = serde_json::from_slice(&create_body).unwrap();
+        let workflow_id = create_json.get("id").and_then(|v| v.as_str()).unwrap();
+
+        let publish_req = HttpRequest::builder()
+            .method("POST")
+            .uri(format!("/v1/workflows/{workflow_id}/publish"))
+            .header("x-tenant-id", tenant_a.to_string())
+            .header("x-roles", "builder")
+            .body(Body::empty())
+            .unwrap();
+        let publish_res = app.clone().oneshot(publish_req).await.unwrap();
+        assert_eq!(publish_res.status(), StatusCode::OK);
 
         let run_req = HttpRequest::builder()
             .method("POST")
@@ -1312,5 +1669,248 @@ mod tests {
 
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn workflow_e2e_create_publish_run_approval_complete() {
+        let tenant = Uuid::new_v4();
+        let app = build_app(test_state());
+
+        let create_res = app.clone().oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri("/v1/workflows")
+                .header("content-type", "application/json")
+                .header("x-tenant-id", tenant.to_string())
+                .header("x-roles", "builder")
+                .body(Body::from(r#"{"name":"wf-e2e","version":"1","definition_json":{"nodes":[{"id":"start"}],"edges":[]}}"#))
+                .unwrap(),
+        ).await.unwrap();
+        assert_eq!(create_res.status(), StatusCode::CREATED);
+        let create_body = to_bytes(create_res.into_body(), usize::MAX).await.unwrap();
+        let create_json: serde_json::Value = serde_json::from_slice(&create_body).unwrap();
+        let workflow_id = create_json.get("id").and_then(|v| v.as_str()).unwrap();
+
+        let publish_res = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri(format!("/v1/workflows/{workflow_id}/publish"))
+                    .header("x-tenant-id", tenant.to_string())
+                    .header("x-roles", "builder")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(publish_res.status(), StatusCode::OK);
+
+        let run_res = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri(format!("/v1/workflows/{workflow_id}/run"))
+                    .header("content-type", "application/json")
+                    .header("x-tenant-id", tenant.to_string())
+                    .header("x-roles", "builder")
+                    .body(Body::from(
+                        r#"{"trigger":"manual","inputs":{"case":"e2e"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(run_res.status(), StatusCode::ACCEPTED);
+        let run_body = to_bytes(run_res.into_body(), usize::MAX).await.unwrap();
+        let run_json: serde_json::Value = serde_json::from_slice(&run_body).unwrap();
+        let run_id = run_json
+            .get("instance_id")
+            .and_then(|v| v.as_str())
+            .unwrap();
+
+        let approvals_res = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("GET")
+                    .uri("/v1/approvals?status=pending")
+                    .header("x-tenant-id", tenant.to_string())
+                    .header("x-roles", "approver")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(approvals_res.status(), StatusCode::OK);
+        let approvals_body = to_bytes(approvals_res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let approvals_json: serde_json::Value = serde_json::from_slice(&approvals_body).unwrap();
+        let approval_id = approvals_json["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item.get("run_id").and_then(|v| v.as_str()) == Some(run_id))
+            .and_then(|item| item.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap();
+
+        let decide_res = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri(format!("/v1/approvals/{approval_id}/decision"))
+                    .header("content-type", "application/json")
+                    .header("x-tenant-id", tenant.to_string())
+                    .header("x-roles", "approver")
+                    .body(Body::from(r#"{"decision":"approve","comment":"ship it"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(decide_res.status(), StatusCode::OK);
+
+        let instance_res = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("GET")
+                    .uri(format!("/v1/workflow-instances/{run_id}"))
+                    .header("x-tenant-id", tenant.to_string())
+                    .header("x-roles", "builder")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(instance_res.status(), StatusCode::OK);
+        let instance_body = to_bytes(instance_res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let instance_json: serde_json::Value = serde_json::from_slice(&instance_body).unwrap();
+        assert_eq!(
+            instance_json.get("status").and_then(|v| v.as_str()),
+            Some("succeeded")
+        );
+    }
+
+    #[tokio::test]
+    async fn tenant_isolation_negative_for_workflow_list_get_run_and_approvals() {
+        let tenant_a = Uuid::new_v4();
+        let tenant_b = Uuid::new_v4();
+        let app = build_app(test_state());
+
+        let create_res = app.clone().oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri("/v1/workflows")
+                .header("content-type", "application/json")
+                .header("x-tenant-id", tenant_a.to_string())
+                .header("x-roles", "builder")
+                .body(Body::from(r#"{"name":"wf-iso","version":"1","definition_json":{"nodes":[{"id":"start"}],"edges":[]}}"#))
+                .unwrap(),
+        ).await.unwrap();
+        let create_body = to_bytes(create_res.into_body(), usize::MAX).await.unwrap();
+        let create_json: serde_json::Value = serde_json::from_slice(&create_body).unwrap();
+        let workflow_id = create_json.get("id").and_then(|v| v.as_str()).unwrap();
+
+        let _ = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri(format!("/v1/workflows/{workflow_id}/publish"))
+                    .header("x-tenant-id", tenant_a.to_string())
+                    .header("x-roles", "builder")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let _ = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri(format!("/v1/workflows/{workflow_id}/run"))
+                    .header("content-type", "application/json")
+                    .header("x-tenant-id", tenant_a.to_string())
+                    .header("x-roles", "builder")
+                    .body(Body::from(r#"{"trigger":"manual"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let list_res = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("GET")
+                    .uri("/v1/workflows")
+                    .header("x-tenant-id", tenant_b.to_string())
+                    .header("x-roles", "builder")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_res.status(), StatusCode::OK);
+        let list_body = to_bytes(list_res.into_body(), usize::MAX).await.unwrap();
+        let list_json: serde_json::Value = serde_json::from_slice(&list_body).unwrap();
+        assert_eq!(list_json["items"].as_array().unwrap().len(), 0);
+
+        let get_res = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("GET")
+                    .uri(format!("/v1/workflows/{workflow_id}"))
+                    .header("x-tenant-id", tenant_b.to_string())
+                    .header("x-roles", "builder")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_res.status(), StatusCode::NOT_FOUND);
+
+        let run_res = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri(format!("/v1/workflows/{workflow_id}/run"))
+                    .header("content-type", "application/json")
+                    .header("x-tenant-id", tenant_b.to_string())
+                    .header("x-roles", "builder")
+                    .body(Body::from(r#"{"trigger":"manual"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(run_res.status(), StatusCode::NOT_FOUND);
+
+        let approvals_res = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("GET")
+                    .uri("/v1/approvals?status=pending")
+                    .header("x-tenant-id", tenant_b.to_string())
+                    .header("x-roles", "approver")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(approvals_res.status(), StatusCode::OK);
+        let approvals_body = to_bytes(approvals_res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let approvals_json: serde_json::Value = serde_json::from_slice(&approvals_body).unwrap();
+        assert_eq!(approvals_json["items"].as_array().unwrap().len(), 0);
     }
 }
