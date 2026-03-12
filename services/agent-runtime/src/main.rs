@@ -9,7 +9,11 @@ async fn main() {
         .init();
 
     let app = Router::new().route("/health", get(health));
-    let addr = SocketAddr::from(([0, 0, 0, 0], 8081));
+    let port = std::env::var("AGENT_RUNTIME_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(8081);
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     info!("agent-runtime listening on {addr}");
     let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
     axum::serve(listener, app).await.expect("serve");

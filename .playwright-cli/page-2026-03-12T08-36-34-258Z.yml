@@ -1,0 +1,130 @@
+- main [ref=e2]:
+  - generic [ref=e3]:
+    - generic [ref=e4]:
+      - generic [ref=e5]: Flow Mesh Enterprise
+      - heading "Workflow Control Plane" [level=1] [ref=e6]
+      - paragraph [ref=e7]: Design, validate, and operate production workflows with policy checks and human approvals.
+    - generic [ref=e8]:
+      - generic [ref=e9]: Gateway Online
+      - generic [ref=e11]: "Tenant: acme-finance"
+      - generic [ref=e12]: "Region: us-east-1"
+      - generic [ref=e13]: Build v0.3.0
+  - generic [ref=e14]:
+    - button "Builder" [ref=e15] [cursor=pointer]
+    - button "Runs" [ref=e16] [cursor=pointer]
+    - button "Approvals" [ref=e17] [cursor=pointer]
+    - button "Admin" [ref=e18] [cursor=pointer]
+    - button "Observability" [ref=e19] [cursor=pointer]
+  - generic [ref=e21]:
+    - complementary [ref=e22]:
+      - heading "Workflow Catalog" [level=2] [ref=e23]
+      - list [ref=e24]:
+        - listitem [ref=e25]:
+          - generic [ref=e26]: Invoice Reconciliation
+          - generic [ref=e27]: v12
+        - listitem [ref=e28]:
+          - generic [ref=e29]: Vendor Onboarding
+          - generic [ref=e30]: draft
+        - listitem [ref=e31]:
+          - generic [ref=e32]: Claims Fraud Review
+          - generic [ref=e33]: v4
+      - heading "Node Library" [level=2] [ref=e34]
+      - list [ref=e35]:
+        - listitem [ref=e36]:
+          - generic [ref=e37]: Triggers
+          - generic [ref=e38]: "5"
+        - listitem [ref=e39]:
+          - generic [ref=e40]: AI Steps
+          - generic [ref=e41]: "8"
+        - listitem [ref=e42]:
+          - generic [ref=e43]: Tool Calls
+          - generic [ref=e44]: "14"
+        - listitem [ref=e45]:
+          - generic [ref=e46]: Approvals
+          - generic [ref=e47]: "3"
+    - generic [ref=e48]:
+      - generic [ref=e49]:
+        - article [ref=e50]:
+          - generic [ref=e51]: Draft Version
+          - generic [ref=e52]: Invoice Reconciliation v13-draft
+        - article [ref=e53]:
+          - generic [ref=e54]: Validation
+          - generic [ref=e55]: 0 errors, 1 warning
+        - article [ref=e56]:
+          - generic [ref=e57]: Policy Guard
+          - generic [ref=e58]: All checks passing
+        - article [ref=e59]:
+          - generic [ref=e60]: Last Save
+          - generic [ref=e61]: 14 seconds ago
+      - article [ref=e62]:
+        - generic [ref=e63]:
+          - heading "Workflow Canvas" [level=2] [ref=e64]
+          - generic [ref=e65]:
+            - generic [ref=e66]: Auto Layout
+            - generic [ref=e67]: Dry Run
+            - generic [ref=e68]: Publish
+        - generic [ref=e69]:
+          - article [ref=e74]:
+            - generic [ref=e75]: Webhook Trigger
+            - generic [ref=e76]: invoice.received
+            - generic [ref=e77]: Input schema v3
+          - article [ref=e78]:
+            - generic [ref=e79]: LLM Planner
+            - generic [ref=e80]: Classify + route
+            - generic [ref=e81]: "model: gpt-5-mini"
+          - article [ref=e82]:
+            - generic [ref=e83]: Tool Node
+            - generic [ref=e84]: ERP Lookup
+            - generic [ref=e85]: "timeout: 4s, retry: 2"
+          - article [ref=e86]:
+            - generic [ref=e87]: Approval Gate
+            - generic [ref=e88]: Manager Approval
+            - generic [ref=e89]: "SLA: 15m"
+          - article [ref=e90]:
+            - generic [ref=e91]: Tool Node
+            - generic [ref=e92]: Post Journal
+            - generic [ref=e93]: "idempotency: on"
+    - complementary [ref=e94]:
+      - article [ref=e95]:
+        - heading "Node Inspector" [level=2] [ref=e96]
+        - generic [ref=e97]:
+          - generic [ref=e98]:
+            - generic [ref=e99]: Selected Node
+            - generic [ref=e100]: Manager Approval
+          - generic [ref=e101]:
+            - generic [ref=e102]: Type
+            - generic [ref=e103]: Human Approval
+          - generic [ref=e104]:
+            - generic [ref=e105]: SLA
+            - generic [ref=e106]: 15 minutes
+          - generic [ref=e107]:
+            - generic [ref=e108]: Escalation
+            - generic [ref=e109]: Ops Channel
+      - article [ref=e110]:
+        - heading "Run Readiness" [level=2] [ref=e111]
+        - generic [ref=e112]:
+          - generic [ref=e113]: Schema valid
+          - generic [ref=e114]: Retries configured
+          - generic [ref=e115]: 1 policy warning
+        - list [ref=e116]:
+          - listitem [ref=e117]:
+            - generic [ref=e118]: POST /v1/workflows
+            - generic [ref=e119]: create
+          - listitem [ref=e120]:
+            - generic [ref=e121]: "POST /v1/workflows/{id}/publish"
+            - generic [ref=e122]: version
+          - listitem [ref=e123]:
+            - generic [ref=e124]: "POST /v1/workflows/{id}/simulate"
+            - generic [ref=e125]: dry-run
+      - article [ref=e126]:
+        - heading "Live Queue" [level=2] [ref=e127]
+        - list [ref=e128]:
+          - listitem [ref=e129]:
+            - generic [ref=e130]: tr_9ca82f2
+            - generic [ref=e131]: running
+          - listitem [ref=e132]:
+            - generic [ref=e133]: tr_4db770a
+            - generic [ref=e134]: completed
+          - listitem [ref=e135]:
+            - generic [ref=e136]: tr_1aa72cc
+            - generic [ref=e137]: failed

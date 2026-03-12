@@ -3,7 +3,7 @@ use axum::{
     extract::{Request, State},
     http::{StatusCode, header::AUTHORIZATION, header::HeaderName},
     middleware::Next,
-    response::IntoResponse,
+    response::{Html, IntoResponse},
     routing::{get, post},
 };
 use platform_common::{TenantContext, decode_access_token};
@@ -45,6 +45,7 @@ async fn main() {
     let state = AppState { db, jwt_secret };
 
     let app = Router::new()
+        .route("/", get(ui_shell))
         .route("/health", get(health))
         .route("/v1/runtime/complete", post(stub_complete))
         .route("/v1/admin/tenants", get(admin_tenant_list))
@@ -54,7 +55,11 @@ async fn main() {
         ))
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
+    let port = std::env::var("API_GATEWAY_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(8080);
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     info!("api-gateway listening on {addr}");
     let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
     axum::serve(listener, app).await.expect("serve");
@@ -62,6 +67,10 @@ async fn main() {
 
 async fn health() -> impl IntoResponse {
     Json(serde_json::json!({"status":"ok","service":"api-gateway"}))
+}
+
+async fn ui_shell() -> Html<&'static str> {
+    Html(include_str!("ui_index.html"))
 }
 
 async fn stub_complete(req: Request) -> impl IntoResponse {
@@ -120,7 +129,7 @@ async fn tenant_context_middleware(
     mut req: Request,
     next: Next,
 ) -> Result<axum::response::Response, StatusCode> {
-    if req.uri().path() == "/health" {
+    if is_public_path(req.uri().path()) {
         return Ok(next.run(req).await);
     }
 
@@ -128,6 +137,10 @@ async fn tenant_context_middleware(
     req.extensions_mut().insert(ctx);
 
     Ok(next.run(req).await)
+}
+
+fn is_public_path(path: &str) -> bool {
+    matches!(path, "/" | "/health")
 }
 
 fn extract_context(

@@ -5,6 +5,7 @@ Enterprise multi-tenant AI orchestration platform.
 ## Current Status
 - Product/architecture/docs baseline complete
 - Phase 0 bootstrap in progress
+- Detailed progress report: `docs/FEATURE_PROGRESS.md`
 
 ## Repo Layout
 - `services/` runtime services
@@ -18,3 +19,8 @@ cargo build
 cargo test
 cargo run -p api-gateway
 ```
+
+Then open:
+
+- API Gateway health: `http://127.0.0.1:8080/health`
+- Control Plane UI shell: `http://127.0.0.1:8080/`
