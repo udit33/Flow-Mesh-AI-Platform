@@ -11,6 +11,19 @@ npm run dev
 
 Open `http://localhost:3000`.
 
+## Headless browser tests (Playwright)
+```bash
+cd apps/control-plane-ui
+npm install
+npx playwright install --with-deps chromium
+npm run test:e2e
+```
+
+Headed/debug:
+```bash
+npm run test:e2e:headed
+```
+
 ## Environment
 - `NEXT_PUBLIC_API_BASE_URL` (default: `http://127.0.0.1:8080`)
 
