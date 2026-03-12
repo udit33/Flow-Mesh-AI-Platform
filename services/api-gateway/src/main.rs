@@ -1,7 +1,7 @@
 use axum::{
     Extension, Json, Router,
     extract::{Path, Query, Request, State},
-    http::{StatusCode, header::AUTHORIZATION, header::HeaderName},
+    http::{Method, StatusCode, header::AUTHORIZATION, header::HeaderName},
     middleware::Next,
     response::{Html, IntoResponse},
     routing::{get, post},
@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tokio::sync::RwLock;
+use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -339,6 +340,14 @@ async fn init_state() -> AppState {
 }
 
 fn build_app(state: AppState) -> Router {
+    let cors = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers(AllowHeaders::any())
+        .allow_origin(AllowOrigin::list([
+            "http://localhost:3000".parse().unwrap(),
+            "http://127.0.0.1:3000".parse().unwrap(),
+        ]));
+
     Router::new()
         .route("/", get(ui_shell))
         .route("/health", get(health))
@@ -379,6 +388,7 @@ fn build_app(state: AppState) -> Router {
             state.clone(),
             tenant_context_middleware,
         ))
+        .layer(cors)
         .with_state(state)
 }
 
