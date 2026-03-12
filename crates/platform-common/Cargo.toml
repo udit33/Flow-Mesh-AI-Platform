@@ -8,3 +8,5 @@ license.workspace = true
 serde.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
+chrono.workspace = true
+jsonwebtoken.workspace = true

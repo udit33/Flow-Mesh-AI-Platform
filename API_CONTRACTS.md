@@ -3,8 +3,9 @@
 ## 1) Runtime API
 ### POST /v1/runtime/complete
 Headers:
-- `x-tenant-id: <uuid>` (required)
-- `x-roles: tenant_admin,builder,...` (optional)
+- `Authorization: Bearer <jwt>` (preferred; when JWT is configured)
+- `x-tenant-id: <uuid>` (bootstrap/dev fallback)
+- `x-roles: tenant_admin,builder,...` (bootstrap/dev fallback)
 
 Request:
 ```json
