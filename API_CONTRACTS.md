@@ -23,11 +23,15 @@ Response:
 {
   "trace_id": "tr_123",
   "output": "...",
-  "citations": [],
-  "tool_calls": [],
-  "latency_ms": 842
+  "selected_agent": "supervisor",
+  "delegated_to": "workflow-specialist",
+  "steps": []
 }
 ```
+
+Notes:
+- API gateway forwards runtime requests to `AGENT_RUNTIME_URL/v1/agent/execute`.
+- Returns `502` when agent-runtime is unavailable.
 
 ### POST /v1/agent/execute (agent-runtime service)
 Request:

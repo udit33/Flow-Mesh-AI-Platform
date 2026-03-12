@@ -14,6 +14,7 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 sqlx.workspace = true
 chrono.workspace = true
+reqwest.workspace = true
 platform-common = { path = "../../crates/platform-common" }
 
 [dev-dependencies]

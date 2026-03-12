@@ -18,6 +18,8 @@ use uuid::Uuid;
 struct AppState {
     db: Option<PgPool>,
     jwt_secret: Option<Arc<String>>,
+    agent_runtime_url: Arc<String>,
+    http_client: reqwest::Client,
     workflow_runs: Arc<RwLock<HashMap<Uuid, WorkflowRun>>>,
     tools: Arc<RwLock<HashMap<Uuid, ToolRecord>>>,
     audit_events: Arc<RwLock<Vec<AuditEventRecord>>>,
@@ -114,6 +116,20 @@ struct InvokeToolRequest {
     scope: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct RuntimeCompleteRequest {
+    input: String,
+    preferred_agent: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentExecuteRequest {
+    tenant_id: Uuid,
+    user_id: Option<Uuid>,
+    input: String,
+    preferred_agent: Option<String>,
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -135,6 +151,12 @@ async fn main() {
 
 async fn init_state() -> AppState {
     let jwt_secret = std::env::var("JWT_SECRET").ok().map(Arc::new);
+    let agent_runtime_url =
+        std::env::var("AGENT_RUNTIME_URL").unwrap_or_else(|_| "http://127.0.0.1:8081".to_string());
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .expect("http client");
 
     let db = if let Ok(database_url) = std::env::var("DATABASE_URL") {
         match PgPoolOptions::new()
@@ -155,6 +177,8 @@ async fn init_state() -> AppState {
     AppState {
         db,
         jwt_secret,
+        agent_runtime_url: Arc::new(agent_runtime_url),
+        http_client,
         workflow_runs: Arc::new(RwLock::new(HashMap::new())),
         tools: Arc::new(RwLock::new(HashMap::new())),
         audit_events: Arc::new(RwLock::new(Vec::new())),
@@ -193,12 +217,46 @@ async fn ui_shell() -> Html<&'static str> {
     Html(include_str!("ui_index.html"))
 }
 
-async fn stub_complete(Extension(ctx): Extension<TenantContext>) -> impl IntoResponse {
-    Json(serde_json::json!({
-        "trace_id": "tr_bootstrap",
-        "message": "runtime completion stub ready",
+async fn stub_complete(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+    Json(payload): Json<RuntimeCompleteRequest>,
+) -> Result<impl IntoResponse, StatusCode> {
+    if payload.input.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let request = AgentExecuteRequest {
+        tenant_id: ctx.tenant_id,
+        user_id: ctx.user_id,
+        input: payload.input,
+        preferred_agent: payload.preferred_agent,
+    };
+
+    let url = format!("{}/v1/agent/execute", state.agent_runtime_url);
+    let response = state
+        .http_client
+        .post(url)
+        .json(&request)
+        .send()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
+
+    if !status.is_success() {
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+
+    Ok(Json(serde_json::json!({
+        "trace_id": body.get("trace_id"),
+        "output": body.get("output"),
+        "selected_agent": body.get("selected_agent"),
+        "delegated_to": body.get("delegated_to"),
+        "steps": body.get("steps"),
         "tenant_context": ctx
-    }))
+    })))
 }
 
 async fn admin_tenant_list(
@@ -912,6 +970,11 @@ mod tests {
         AppState {
             db: None,
             jwt_secret: None,
+            agent_runtime_url: Arc::new("http://127.0.0.1:65535".to_string()),
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_millis(200))
+                .build()
+                .unwrap(),
             workflow_runs: Arc::new(RwLock::new(HashMap::new())),
             tools: Arc::new(RwLock::new(HashMap::new())),
             audit_events: Arc::new(RwLock::new(Vec::new())),
