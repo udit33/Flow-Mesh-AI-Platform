@@ -209,7 +209,21 @@ Request:
 }
 ```
 
-## 5) Common Error Envelope
+## 5) Policy Guard (v1)
+- Actions now pass through tenant policy checks when DB policy rows exist:
+  - `runtime.complete`
+  - `workflow.run`
+  - `tool.register`
+  - `tool.invoke`
+- Policy document shape (stored in `policies.policy_json`):
+```json
+{
+  "allow_roles": ["tenant_admin", "builder"],
+  "deny_roles": ["suspended"]
+}
+```
+
+## 6) Common Error Envelope
 ```json
 {
   "error": {

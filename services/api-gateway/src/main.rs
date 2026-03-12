@@ -103,6 +103,14 @@ struct AuditEventRecord {
 }
 
 #[derive(Debug, Deserialize)]
+struct PolicyDoc {
+    #[serde(default)]
+    allow_roles: Vec<String>,
+    #[serde(default)]
+    deny_roles: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct RegisterToolRequest {
     name: String,
     kind: String,
@@ -226,6 +234,8 @@ async fn stub_complete(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    enforce_policy(&state, &ctx, "runtime.complete").await?;
+
     let request = AgentExecuteRequest {
         tenant_id: ctx.tenant_id,
         user_id: ctx.user_id,
@@ -303,6 +313,7 @@ async fn run_workflow(
     if !ctx.has_role("tenant_admin") && !ctx.has_role("builder") {
         return Err(StatusCode::FORBIDDEN);
     }
+    enforce_policy(&state, &ctx, "workflow.run").await?;
 
     let instance_id = Uuid::new_v4();
     let trace_id = format!("tr_{}", Uuid::new_v4().simple());
@@ -382,6 +393,7 @@ async fn register_tool(
     if !can_register_tools(&ctx) {
         return Err(StatusCode::FORBIDDEN);
     }
+    enforce_policy(&state, &ctx, "tool.register").await?;
 
     validate_tool_request(&payload).map_err(|_| StatusCode::BAD_REQUEST)?;
 
@@ -438,6 +450,7 @@ async fn invoke_tool(
     if !can_invoke_tool(&ctx, tool_id, &scope) {
         return Err(StatusCode::FORBIDDEN);
     }
+    enforce_policy(&state, &ctx, "tool.invoke").await?;
 
     let trace_id = format!("tr_{}", Uuid::new_v4().simple());
     let input = payload.input.unwrap_or(serde_json::json!({}));
@@ -791,6 +804,54 @@ async fn fetch_tool(
         .get(&tool_id)
         .filter(|t| t.tenant_id == tenant_id)
         .cloned())
+}
+
+async fn enforce_policy(
+    state: &AppState,
+    ctx: &TenantContext,
+    action: &str,
+) -> Result<(), StatusCode> {
+    let Some(db) = &state.db else {
+        // bootstrap mode: no policy DB, allow by default
+        return Ok(());
+    };
+
+    let rows = sqlx::query(
+        "SELECT policy_json FROM policies WHERE tenant_id = $1 AND scope IN ($2, 'global')",
+    )
+    .bind(ctx.tenant_id)
+    .bind(action)
+    .fetch_all(db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    for row in rows {
+        let policy_json = row
+            .try_get::<serde_json::Value, _>("policy_json")
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if !evaluate_policy_doc(&policy_json, &ctx.roles) {
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
+
+    Ok(())
+}
+
+fn evaluate_policy_doc(policy_json: &serde_json::Value, roles: &[String]) -> bool {
+    let Ok(doc) = serde_json::from_value::<PolicyDoc>(policy_json.clone()) else {
+        return true;
+    };
+
+    if doc.deny_roles.iter().any(|r| roles.iter().any(|x| x == r)) {
+        return false;
+    }
+
+    if !doc.allow_roles.is_empty() && !doc.allow_roles.iter().any(|r| roles.iter().any(|x| x == r))
+    {
+        return false;
+    }
+
+    true
 }
 
 fn can_register_tools(ctx: &TenantContext) -> bool {
@@ -1204,6 +1265,20 @@ mod tests {
             let res = app.clone().oneshot(req).await.unwrap();
             assert_eq!(res.status(), StatusCode::OK);
         }
+    }
+
+    #[test]
+    fn policy_doc_allow_and_deny_roles() {
+        let policy = serde_json::json!({"allow_roles":["builder"],"deny_roles":["suspended"]});
+
+        let roles_ok = vec!["builder".to_string()];
+        assert!(evaluate_policy_doc(&policy, &roles_ok));
+
+        let roles_denied = vec!["builder".to_string(), "suspended".to_string()];
+        assert!(!evaluate_policy_doc(&policy, &roles_denied));
+
+        let roles_missing = vec!["user".to_string()];
+        assert!(!evaluate_policy_doc(&policy, &roles_missing));
     }
 
     #[tokio::test]
