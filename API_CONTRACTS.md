@@ -271,8 +271,49 @@ Notes:
 - With `DATABASE_URL` configured, records are persisted to `tools` and `audit_events`; otherwise they use in-memory fallback stores.
 
 ## 4) Approval API
+### Approval entity
+```json
+{
+  "id": "<approval_uuid>",
+  "tenant_id": "<tenant_uuid>",
+  "run_id": "<workflow_run_uuid>",
+  "requester": "alice@example.com",
+  "reason": "Production workflow requires human approval",
+  "due_at": "2026-03-12T14:00:00Z",
+  "status": "pending",
+  "created_at": "2026-03-12T13:00:00Z",
+  "decided_at": null
+}
+```
+
+### GET /v1/approvals?status=pending
+Lists approvals for current tenant.
+
+Headers:
+- `Authorization: Bearer <jwt>` (preferred) OR bootstrap headers
+- Role required: `approver` or `tenant_admin`
+
+Query params:
+- `status` (optional): `pending | approved | rejected`
+
+Response:
+```json
+{
+  "items": [
+    {
+      "id": "<approval_uuid>",
+      "run_id": "<workflow_run_uuid>",
+      "requester": "alice@example.com",
+      "reason": "Production workflow requires human approval",
+      "due_at": "2026-03-12T14:00:00Z",
+      "status": "pending"
+    }
+  ]
+}
+```
+
 ### POST /v1/approvals/{approval_id}/decision
-> Bootstrap semantics: `approval_id` maps to workflow `instance_id` for now.
+Uses first-class approval IDs (not workflow ID aliases).
 
 Request:
 ```json
@@ -281,6 +322,21 @@ Request:
   "comment": "validated by security"
 }
 ```
+
+Response:
+```json
+{
+  "approval_id": "<approval_uuid>",
+  "status": "approved",
+  "run_id": "<workflow_run_uuid>",
+  "run_status": "succeeded",
+  "comment": "validated by security"
+}
+```
+
+Notes:
+- Decision writes audit event `approval.decision`.
+- Decision writes workflow events (`approval_decided`, terminal run event).
 
 ## 5) Policy Guard (v1)
 - Actions now pass through tenant policy checks when DB policy rows exist:

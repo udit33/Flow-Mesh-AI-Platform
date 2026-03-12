@@ -127,6 +127,22 @@ struct WorkflowRun {
     completed_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkflowRecord {
+    id: Uuid,
+    tenant_id: Uuid,
+    name: String,
+    version: String,
+    definition_json: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateWorkflowRequest {
+    name: String,
+    version: String,
+    definition_json: serde_json::Value,
+}
+
 #[derive(Debug, Deserialize)]
 struct RunWorkflowRequest {
     trigger: Option<String>,
@@ -328,6 +344,12 @@ fn build_app(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/v1/runtime/complete", post(stub_complete))
         .route("/v1/admin/tenants", get(admin_tenant_list))
+        .route("/v1/workflows", post(create_workflow).get(list_workflows))
+        .route("/v1/workflows/{workflow_id}", get(get_workflow))
+        .route(
+            "/v1/workflows/{workflow_id}/publish",
+            post(publish_workflow),
+        )
         .route("/v1/workflows/{workflow_id}/run", post(run_workflow))
         .route("/v1/workflow-instances", get(list_workflow_instances))
         .route(
@@ -447,6 +469,74 @@ async fn admin_tenant_list(
     })))
 }
 
+async fn create_workflow(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+    Json(payload): Json<CreateWorkflowRequest>,
+) -> Result<impl IntoResponse, StatusCode> {
+    if !ctx.has_role("tenant_admin") && !ctx.has_role("builder") {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let wf = WorkflowRecord {
+        id: Uuid::new_v4(),
+        tenant_id: ctx.tenant_id,
+        name: payload.name,
+        version: payload.version,
+        definition_json: payload.definition_json,
+    };
+    state.workflows.write().await.insert(wf.id, wf.clone());
+    Ok((StatusCode::CREATED, Json(wf)))
+}
+
+async fn list_workflows(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let items: Vec<WorkflowRecord> = state
+        .workflows
+        .read()
+        .await
+        .values()
+        .filter(|w| w.tenant_id == ctx.tenant_id)
+        .cloned()
+        .collect();
+    Ok(Json(serde_json::json!({"items": items})))
+}
+
+async fn get_workflow(
+    State(state): State<AppState>,
+    Path(workflow_id): Path<Uuid>,
+    Extension(ctx): Extension<TenantContext>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let wf = state
+        .workflows
+        .read()
+        .await
+        .get(&workflow_id)
+        .filter(|w| w.tenant_id == ctx.tenant_id)
+        .cloned()
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(wf))
+}
+
+async fn publish_workflow(
+    State(state): State<AppState>,
+    Path(workflow_id): Path<Uuid>,
+    Extension(ctx): Extension<TenantContext>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let wf = state
+        .workflows
+        .read()
+        .await
+        .get(&workflow_id)
+        .filter(|w| w.tenant_id == ctx.tenant_id)
+        .cloned()
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(
+        serde_json::json!({"workflow_id": wf.id, "published": true}),
+    ))
+}
+
 async fn run_workflow(
     State(state): State<AppState>,
     Path(workflow_id): Path<Uuid>,
@@ -458,6 +548,12 @@ async fn run_workflow(
     }
     enforce_policy(&state, &ctx, "workflow.run").await?;
 
+    if let Some(existing) = state.workflows.read().await.get(&workflow_id).cloned() {
+        if existing.tenant_id != ctx.tenant_id {
+            return Err(StatusCode::NOT_FOUND);
+        }
+    }
+
     let instance_id = Uuid::new_v4();
     let trace_id = format!("tr_{}", Uuid::new_v4().simple());
 
@@ -465,8 +561,8 @@ async fn run_workflow(
         instance_id,
         tenant_id: ctx.tenant_id,
         workflow_id,
-        status: WorkflowRunStatus::WaitingApproval,
-        current_node: Some("approval".to_string()),
+        status: WorkflowRunStatus::Running,
+        current_node: Some("start".to_string()),
         trace_id: trace_id.clone(),
         started_at: chrono::Utc::now().to_rfc3339(),
         completed_at: None,
@@ -478,7 +574,10 @@ async fn run_workflow(
         id: Uuid::new_v4(),
         tenant_id: ctx.tenant_id,
         run_id: instance_id,
-        requester: ctx.user_id.map(|u| u.to_string()).unwrap_or_else(|| "system".to_string()),
+        requester: ctx
+            .user_id
+            .map(|u| u.to_string())
+            .unwrap_or_else(|| "system".to_string()),
         reason: "Workflow execution requires approval".to_string(),
         due_at: (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
         status: ApprovalStatus::Pending,
@@ -503,7 +602,7 @@ async fn run_workflow(
         ctx.tenant_id,
         WorkflowEventType::ApprovalWaiting,
         Some("approval".to_string()),
-        Some(WorkflowRunStatus::WaitingApproval),
+        Some(WorkflowRunStatus::Running),
         serde_json::json!({"approval_id": approval.id}),
     )
     .await;
@@ -1083,7 +1182,11 @@ async fn persist_approval(state: &AppState, approval: &ApprovalRecord) -> Result
         return Ok(());
     }
 
-    state.approvals.write().await.insert(approval.id, approval.clone());
+    state
+        .approvals
+        .write()
+        .await
+        .insert(approval.id, approval.clone());
     Ok(())
 }
 
@@ -1118,7 +1221,10 @@ async fn set_workflow_run_status(
         return Err(StatusCode::FORBIDDEN);
     }
     run.status = target_status;
-    if matches!(run.status, WorkflowRunStatus::Succeeded | WorkflowRunStatus::Failed | WorkflowRunStatus::Cancelled) {
+    if matches!(
+        run.status,
+        WorkflowRunStatus::Succeeded | WorkflowRunStatus::Failed | WorkflowRunStatus::Cancelled
+    ) {
         run.completed_at = Some(chrono::Utc::now().to_rfc3339());
     }
     Ok(run.clone())
@@ -1129,10 +1235,15 @@ async fn retry_workflow_run(
     instance_id: Uuid,
     tenant_id: Uuid,
 ) -> Result<WorkflowRun, StatusCode> {
-    let mut run = set_workflow_run_status(state, instance_id, tenant_id, WorkflowRunStatus::Running).await?;
+    let mut run =
+        set_workflow_run_status(state, instance_id, tenant_id, WorkflowRunStatus::Running).await?;
     run.current_node = Some("start".to_string());
     run.completed_at = None;
-    state.workflow_runs.write().await.insert(instance_id, run.clone());
+    state
+        .workflow_runs
+        .write()
+        .await
+        .insert(instance_id, run.clone());
     Ok(run)
 }
 
@@ -1154,8 +1265,16 @@ async fn fetch_workflow_events(
                 instance_id: e.run_id,
                 tenant_id: e.tenant_id,
                 event_type,
-                node_id: e.payload_json.get("node_id").and_then(|v| v.as_str()).map(|v| v.to_string()),
-                status: e.payload_json.get("status").and_then(|v| v.as_str()).and_then(WorkflowRunStatus::from_db_str),
+                node_id: e
+                    .payload_json
+                    .get("node_id")
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.to_string()),
+                status: e
+                    .payload_json
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .and_then(WorkflowRunStatus::from_db_str),
                 created_at: e.created_at.clone(),
                 data: e.payload_json.clone(),
             })
@@ -1179,14 +1298,18 @@ async fn record_workflow_event(
         "status": status.as_ref().map(|s| s.as_db_str()),
         "data": data,
     });
-    state.workflow_events.write().await.push(WorkflowEventRecord {
-        id: Uuid::new_v4(),
-        tenant_id,
-        run_id: instance_id,
-        event_type: event_type.as_str().to_string(),
-        payload_json: payload,
-        created_at: chrono::Utc::now().to_rfc3339(),
-    });
+    state
+        .workflow_events
+        .write()
+        .await
+        .push(WorkflowEventRecord {
+            id: Uuid::new_v4(),
+            tenant_id,
+            run_id: instance_id,
+            event_type: event_type.as_str().to_string(),
+            payload_json: payload,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        });
 }
 
 async fn persist_tool(state: &AppState, tool: &ToolRecord) -> Result<(), StatusCode> {
@@ -1796,6 +1919,20 @@ mod tests {
                 completed_at: None,
             },
         );
+        state.approvals.write().await.insert(
+            approval_id,
+            ApprovalRecord {
+                id: approval_id,
+                tenant_id: tenant,
+                run_id: approval_id,
+                requester: "alice@example.com".to_string(),
+                reason: "Need approval".to_string(),
+                due_at: chrono::Utc::now().to_rfc3339(),
+                status: ApprovalStatus::Pending,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                decided_at: None,
+            },
+        );
         let app = build_app(state);
 
         for _ in 0..2 {
@@ -1843,6 +1980,20 @@ mod tests {
                 trace_id: "tr_test".to_string(),
                 started_at: chrono::Utc::now().to_rfc3339(),
                 completed_at: Some(chrono::Utc::now().to_rfc3339()),
+            },
+        );
+        state.approvals.write().await.insert(
+            approval_id,
+            ApprovalRecord {
+                id: approval_id,
+                tenant_id: tenant,
+                run_id: approval_id,
+                requester: "alice@example.com".to_string(),
+                reason: "Need approval".to_string(),
+                due_at: chrono::Utc::now().to_rfc3339(),
+                status: ApprovalStatus::Approved,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                decided_at: Some(chrono::Utc::now().to_rfc3339()),
             },
         );
         let app = build_app(state);
