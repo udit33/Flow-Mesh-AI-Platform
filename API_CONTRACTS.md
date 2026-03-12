@@ -31,21 +31,24 @@ Response:
 
 ## 2) Workflow API
 ### POST /v1/workflows/{workflow_id}/run
+Headers:
+- `Authorization: Bearer <jwt>` (preferred) OR bootstrap headers
+
 Request:
 ```json
 {
-  "tenant_id": "t1",
-  "workspace_id": "w1",
   "trigger": "api",
   "inputs": {"ticket_id": "INC-1021"}
 }
 ```
-Response:
+Response (202 Accepted):
 ```json
 {
   "instance_id": "wf_run_001",
   "status": "running",
-  "trace_id": "tr_456"
+  "trace_id": "tr_456",
+  "trigger": "api",
+  "inputs": {"ticket_id": "INC-1021"}
 }
 ```
 
@@ -54,9 +57,13 @@ Response:
 ```json
 {
   "instance_id": "wf_run_001",
-  "status": "waiting_approval",
-  "current_node": "manager_approval",
-  "started_at": "2026-03-11T00:00:00Z"
+  "tenant_id": "...",
+  "workflow_id": "...",
+  "status": "running",
+  "current_node": "start",
+  "trace_id": "tr_456",
+  "started_at": "2026-03-11T00:00:00Z",
+  "completed_at": null
 }
 ```
 
@@ -69,6 +76,8 @@ Invokes tool with policy/permission checks.
 
 ## 4) Approval API
 ### POST /v1/approvals/{approval_id}/decision
+> Bootstrap semantics: `approval_id` maps to workflow `instance_id` for now.
+
 Request:
 ```json
 {
