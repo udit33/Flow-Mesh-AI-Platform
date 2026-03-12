@@ -29,6 +29,29 @@ Response:
 }
 ```
 
+### POST /v1/agent/execute (agent-runtime service)
+Request:
+```json
+{
+  "tenant_id": "<uuid>",
+  "user_id": "<uuid>",
+  "input": "run workflow for approval",
+  "preferred_agent": null
+}
+```
+Response:
+```json
+{
+  "trace_id": "tr_xxx",
+  "selected_agent": "supervisor",
+  "delegated_to": "workflow-specialist",
+  "steps": [
+    {"step":1,"actor":"supervisor","action":"intent_classification","result":"..."}
+  ],
+  "output": "Request processed by supervisor..."
+}
+```
+
 ## 2) Workflow API
 ### POST /v1/workflows/{workflow_id}/run
 Headers:

@@ -13,6 +13,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -50,6 +51,7 @@ name = "api-gateway"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "chrono",
  "platform-common",
  "serde",
  "serde_json",
