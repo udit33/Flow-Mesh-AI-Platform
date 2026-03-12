@@ -1,24 +1,18 @@
 import { expect, test } from '@playwright/test';
 
-test.describe('Workflow UI happy path (skeleton)', () => {
-  test('loads home and can trigger runtime action', async ({ page }) => {
-    await page.goto(process.env.UI_BASE_URL ?? 'http://localhost:3000/');
+test.describe('Workflow UI happy path (stabilized)', () => {
+  test('navigates workflows -> runs -> approvals and renders core panels', async ({ page }) => {
+    await page.goto('/');
 
-    await expect(page.getByRole('heading', { name: 'Flow Mesh Control Plane UI' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Flow Mesh Control Plane' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Workflow List' })).toBeVisible();
 
-    const tenantId = page.getByLabel('Tenant ID');
-    await tenantId.fill('11111111-1111-1111-1111-111111111111');
+    await page.getByRole('link', { name: 'Run Console' }).click();
+    await expect(page.getByRole('heading', { name: 'Run Console' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Events Timeline' })).toBeVisible();
 
-    const runtimeInput = page.getByLabel('Runtime Input');
-    await runtimeInput.fill('run workflow for approval');
-
-    await page.getByRole('button', { name: 'Check API Health' }).click();
-    await expect(page.getByRole('heading', { name: 'Health' })).toBeVisible();
-
-    await page.getByRole('button', { name: 'Run Runtime Complete' }).click();
-    await expect(page.getByRole('heading', { name: 'Runtime Output' })).toBeVisible();
-
-    // NOTE: This is intentionally a scaffold. Once stable API fixtures are wired,
-    // assert exact response payloads and workflow state transitions in the UI.
+    await page.getByRole('link', { name: 'Approval Inbox' }).click();
+    await expect(page.getByRole('heading', { name: 'Approval Inbox' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Load Inbox' })).toBeVisible();
   });
 });

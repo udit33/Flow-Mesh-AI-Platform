@@ -1,3 +1,7 @@
 /target
 .env
 .DS_Store
+
+apps/control-plane-ui/.next/
+apps/control-plane-ui/node_modules/
+apps/control-plane-ui/test-results/
