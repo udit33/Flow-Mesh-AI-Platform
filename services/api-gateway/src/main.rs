@@ -19,6 +19,8 @@ struct AppState {
     db: Option<PgPool>,
     jwt_secret: Option<Arc<String>>,
     workflow_runs: Arc<RwLock<HashMap<Uuid, WorkflowRun>>>,
+    tools: Arc<RwLock<HashMap<Uuid, ToolRecord>>>,
+    audit_events: Arc<RwLock<Vec<AuditEventRecord>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -75,6 +77,43 @@ struct ApprovalDecisionRequest {
     comment: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ToolRecord {
+    id: Uuid,
+    tenant_id: Uuid,
+    workspace_id: Option<Uuid>,
+    name: String,
+    kind: String,
+    version: String,
+    schema_json: serde_json::Value,
+    created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AuditEventRecord {
+    id: Uuid,
+    tenant_id: Uuid,
+    actor_user_id: Option<Uuid>,
+    event_type: String,
+    trace_id: Option<String>,
+    payload_json: serde_json::Value,
+    created_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisterToolRequest {
+    name: String,
+    kind: String,
+    version: String,
+    schema_json: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct InvokeToolRequest {
+    input: Option<serde_json::Value>,
+    scope: Option<String>,
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -117,6 +156,8 @@ async fn init_state() -> AppState {
         db,
         jwt_secret,
         workflow_runs: Arc::new(RwLock::new(HashMap::new())),
+        tools: Arc::new(RwLock::new(HashMap::new())),
+        audit_events: Arc::new(RwLock::new(Vec::new())),
     }
 }
 
@@ -135,6 +176,8 @@ fn build_app(state: AppState) -> Router {
             "/v1/approvals/{approval_id}/decision",
             post(approval_decision),
         )
+        .route("/v1/tools", post(register_tool).get(list_tools))
+        .route("/v1/tools/{tool_id}/invoke", post(invoke_tool))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             tenant_context_middleware,
@@ -270,6 +313,102 @@ async fn approval_decision(
         "approval_id": approval_id,
         "status": updated.status,
         "comment": payload.comment
+    })))
+}
+
+async fn register_tool(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+    Json(payload): Json<RegisterToolRequest>,
+) -> Result<impl IntoResponse, StatusCode> {
+    if !can_register_tools(&ctx) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    validate_tool_request(&payload).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let tool = ToolRecord {
+        id: Uuid::new_v4(),
+        tenant_id: ctx.tenant_id,
+        workspace_id: ctx.workspace_id,
+        name: payload.name,
+        kind: payload.kind,
+        version: payload.version,
+        schema_json: payload.schema_json,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+
+    persist_tool(&state, &tool).await?;
+
+    record_audit_event(
+        &state,
+        &ctx,
+        "tool.registered",
+        serde_json::json!({
+            "tool_id": tool.id,
+            "name": tool.name,
+            "kind": tool.kind,
+            "version": tool.version,
+            "workspace_id": tool.workspace_id,
+        }),
+        None,
+    )
+    .await;
+
+    Ok((StatusCode::CREATED, Json(tool)))
+}
+
+async fn list_tools(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<TenantContext>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let items = fetch_tools_for_tenant(&state, ctx.tenant_id).await?;
+    Ok(Json(serde_json::json!({ "items": items })))
+}
+
+async fn invoke_tool(
+    State(state): State<AppState>,
+    Path(tool_id): Path<Uuid>,
+    Extension(ctx): Extension<TenantContext>,
+    Json(payload): Json<InvokeToolRequest>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let tool = fetch_tool(&state, ctx.tenant_id, tool_id)
+        .await?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let scope = payload.scope.unwrap_or_else(|| "default".to_string());
+    if !can_invoke_tool(&ctx, tool_id, &scope) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let trace_id = format!("tr_{}", Uuid::new_v4().simple());
+    let input = payload.input.unwrap_or(serde_json::json!({}));
+    let result = serde_json::json!({
+        "ok": true,
+        "tool_id": tool_id,
+        "scope": scope.clone(),
+        "echo": input.clone(),
+    });
+
+    record_audit_event(
+        &state,
+        &ctx,
+        "tool.invoked",
+        serde_json::json!({
+            "tool_id": tool_id,
+            "tool_name": tool.name,
+            "scope": scope,
+            "input": input,
+            "result": result,
+        }),
+        Some(trace_id.clone()),
+    )
+    .await;
+
+    Ok(Json(serde_json::json!({
+        "trace_id": trace_id,
+        "tool_id": tool_id,
+        "result": result,
     })))
 }
 
@@ -460,6 +599,232 @@ async fn apply_approval_decision(
     Ok(run.clone())
 }
 
+async fn persist_tool(state: &AppState, tool: &ToolRecord) -> Result<(), StatusCode> {
+    if let Some(db) = &state.db {
+        sqlx::query(
+            "INSERT INTO tools (id, tenant_id, workspace_id, name, kind, version, schema_json) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(tool.id)
+        .bind(tool.tenant_id)
+        .bind(tool.workspace_id)
+        .bind(&tool.name)
+        .bind(&tool.kind)
+        .bind(&tool.version)
+        .bind(&tool.schema_json)
+        .execute(db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        return Ok(());
+    }
+
+    state.tools.write().await.insert(tool.id, tool.clone());
+    Ok(())
+}
+
+async fn fetch_tools_for_tenant(
+    state: &AppState,
+    tenant_id: Uuid,
+) -> Result<Vec<ToolRecord>, StatusCode> {
+    if let Some(db) = &state.db {
+        let rows = sqlx::query(
+            "SELECT id, tenant_id, workspace_id, name, kind, version, schema_json, created_at FROM tools WHERE tenant_id = $1 ORDER BY created_at DESC",
+        )
+        .bind(tenant_id)
+        .fetch_all(db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        let items = rows
+            .into_iter()
+            .map(|r| {
+                Ok(ToolRecord {
+                    id: r
+                        .try_get("id")
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+                    tenant_id: r
+                        .try_get("tenant_id")
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+                    workspace_id: r
+                        .try_get("workspace_id")
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+                    name: r
+                        .try_get("name")
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+                    kind: r
+                        .try_get("kind")
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+                    version: r
+                        .try_get("version")
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+                    schema_json: r
+                        .try_get("schema_json")
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+                    created_at: r
+                        .try_get::<chrono::DateTime<chrono::Utc>, _>("created_at")
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                        .to_rfc3339(),
+                })
+            })
+            .collect::<Result<Vec<ToolRecord>, StatusCode>>()?;
+        return Ok(items);
+    }
+
+    let tools = state.tools.read().await;
+    Ok(tools
+        .values()
+        .filter(|t| t.tenant_id == tenant_id)
+        .cloned()
+        .collect())
+}
+
+async fn fetch_tool(
+    state: &AppState,
+    tenant_id: Uuid,
+    tool_id: Uuid,
+) -> Result<Option<ToolRecord>, StatusCode> {
+    if let Some(db) = &state.db {
+        let row = sqlx::query(
+            "SELECT id, tenant_id, workspace_id, name, kind, version, schema_json, created_at FROM tools WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(tool_id)
+        .fetch_optional(db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        return row
+            .map(|r| {
+                Ok(ToolRecord {
+                    id: r
+                        .try_get("id")
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+                    tenant_id: r
+                        .try_get("tenant_id")
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+                    workspace_id: r
+                        .try_get("workspace_id")
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+                    name: r
+                        .try_get("name")
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+                    kind: r
+                        .try_get("kind")
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+                    version: r
+                        .try_get("version")
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+                    schema_json: r
+                        .try_get("schema_json")
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+                    created_at: r
+                        .try_get::<chrono::DateTime<chrono::Utc>, _>("created_at")
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                        .to_rfc3339(),
+                })
+            })
+            .transpose();
+    }
+
+    Ok(state
+        .tools
+        .read()
+        .await
+        .get(&tool_id)
+        .filter(|t| t.tenant_id == tenant_id)
+        .cloned())
+}
+
+fn can_register_tools(ctx: &TenantContext) -> bool {
+    ctx.has_role("builder") || ctx.has_role("tenant_admin")
+}
+
+fn can_invoke_tool(ctx: &TenantContext, tool_id: Uuid, scope: &str) -> bool {
+    if can_register_tools(ctx) {
+        return true;
+    }
+
+    if ctx.user_id.is_none() || !ctx.has_role("user") {
+        return false;
+    }
+
+    let tool_scope = format!("tool:invoke:{tool_id}");
+    let named_scope = format!("tool:invoke:{scope}");
+    ctx.has_role("tool:invoke:*") || ctx.has_role(&tool_scope) || ctx.has_role(&named_scope)
+}
+
+fn validate_tool_request(payload: &RegisterToolRequest) -> Result<(), &'static str> {
+    if payload.name.trim().is_empty()
+        || payload.kind.trim().is_empty()
+        || payload.version.trim().is_empty()
+    {
+        return Err("name/kind/version required");
+    }
+
+    let schema = payload
+        .schema_json
+        .as_object()
+        .ok_or("schema_json must be an object")?;
+
+    if let Some(t) = schema.get("type")
+        && !t.is_string()
+    {
+        return Err("schema_json.type must be string");
+    }
+
+    if let Some(props) = schema.get("properties")
+        && !props.is_object()
+    {
+        return Err("schema_json.properties must be object");
+    }
+
+    if let Some(required) = schema.get("required") {
+        let arr = required
+            .as_array()
+            .ok_or("schema_json.required must be array")?;
+        if !arr.iter().all(|v| v.is_string()) {
+            return Err("schema_json.required entries must be strings");
+        }
+    }
+
+    Ok(())
+}
+
+async fn record_audit_event(
+    state: &AppState,
+    ctx: &TenantContext,
+    event_type: &str,
+    payload_json: serde_json::Value,
+    trace_id: Option<String>,
+) {
+    let event = AuditEventRecord {
+        id: Uuid::new_v4(),
+        tenant_id: ctx.tenant_id,
+        actor_user_id: ctx.user_id,
+        event_type: event_type.to_string(),
+        trace_id: trace_id.clone(),
+        payload_json,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+
+    if let Some(db) = &state.db {
+        let _ = sqlx::query(
+            "INSERT INTO audit_events (id, tenant_id, actor_user_id, event_type, trace_id, payload_json) VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(event.id)
+        .bind(event.tenant_id)
+        .bind(event.actor_user_id)
+        .bind(&event.event_type)
+        .bind(trace_id)
+        .bind(&event.payload_json)
+        .execute(db)
+        .await;
+        return;
+    }
+
+    state.audit_events.write().await.push(event);
+}
+
 async fn tenant_context_middleware(
     State(state): State<AppState>,
     mut req: Request,
@@ -519,10 +884,17 @@ fn extract_context(
         })
         .unwrap_or_default();
 
+    let user_header = HeaderName::from_static("x-user-id");
+    let user_id = req
+        .headers()
+        .get(user_header)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| Uuid::parse_str(v).ok());
+
     Ok(TenantContext {
         tenant_id,
         workspace_id: None,
-        user_id: None,
+        user_id,
         roles,
     })
 }
@@ -541,6 +913,8 @@ mod tests {
             db: None,
             jwt_secret: None,
             workflow_runs: Arc::new(RwLock::new(HashMap::new())),
+            tools: Arc::new(RwLock::new(HashMap::new())),
+            audit_events: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -627,6 +1001,73 @@ mod tests {
 
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn register_tool_requires_builder_or_admin() {
+        let tenant = Uuid::new_v4();
+        let app = build_app(test_state());
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/v1/tools")
+            .header("content-type", "application/json")
+            .header("x-tenant-id", tenant.to_string())
+            .header("x-roles", "user,tool:invoke:*")
+            .header("x-user-id", Uuid::new_v4().to_string())
+            .body(Body::from(
+                r#"{"name":"jira","kind":"http","version":"1","schema_json":{"type":"object"}}"#,
+            ))
+            .unwrap();
+
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn invoke_tool_requires_scoped_user_permission() {
+        let tenant = Uuid::new_v4();
+        let state = test_state();
+
+        let tool_id = Uuid::new_v4();
+        state.tools.write().await.insert(
+            tool_id,
+            ToolRecord {
+                id: tool_id,
+                tenant_id: tenant,
+                workspace_id: None,
+                name: "jira".into(),
+                kind: "http".into(),
+                version: "1".into(),
+                schema_json: serde_json::json!({"type":"object"}),
+                created_at: chrono::Utc::now().to_rfc3339(),
+            },
+        );
+
+        let app = build_app(state.clone());
+        let denied_req = HttpRequest::builder()
+            .method("POST")
+            .uri(format!("/v1/tools/{tool_id}/invoke"))
+            .header("content-type", "application/json")
+            .header("x-tenant-id", tenant.to_string())
+            .header("x-roles", "user")
+            .header("x-user-id", Uuid::new_v4().to_string())
+            .body(Body::from(r#"{"scope":"ops","input":{"q":"x"}}"#))
+            .unwrap();
+        let denied_res = app.clone().oneshot(denied_req).await.unwrap();
+        assert_eq!(denied_res.status(), StatusCode::FORBIDDEN);
+
+        let allowed_req = HttpRequest::builder()
+            .method("POST")
+            .uri(format!("/v1/tools/{tool_id}/invoke"))
+            .header("content-type", "application/json")
+            .header("x-tenant-id", tenant.to_string())
+            .header("x-roles", "user,tool:invoke:ops")
+            .header("x-user-id", Uuid::new_v4().to_string())
+            .body(Body::from(r#"{"scope":"ops","input":{"q":"x"}}"#))
+            .unwrap();
+        let allowed_res = app.oneshot(allowed_req).await.unwrap();
+        assert_eq!(allowed_res.status(), StatusCode::OK);
     }
 
     #[tokio::test]
