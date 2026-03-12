@@ -6,6 +6,13 @@ pub struct TenantContext {
     pub tenant_id: Uuid,
     pub workspace_id: Option<Uuid>,
     pub user_id: Option<Uuid>,
+    pub roles: Vec<String>,
+}
+
+impl TenantContext {
+    pub fn has_role(&self, role: &str) -> bool {
+        self.roles.iter().any(|r| r == role)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -14,4 +21,6 @@ pub enum PlatformError {
     MissingTenantContext,
     #[error("unauthorized")]
     Unauthorized,
+    #[error("forbidden")]
+    Forbidden,
 }

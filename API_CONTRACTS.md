@@ -2,10 +2,13 @@
 
 ## 1) Runtime API
 ### POST /v1/runtime/complete
+Headers:
+- `x-tenant-id: <uuid>` (required)
+- `x-roles: tenant_admin,builder,...` (optional)
+
 Request:
 ```json
 {
-  "tenant_id": "t1",
   "workspace_id": "w1",
   "user_id": "u1",
   "session_id": "s1",
